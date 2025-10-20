@@ -1,0 +1,404 @@
+{
+  "version": "15.0",
+  "schema_version": "2025-10-20",
+  "meta": {
+    "name": "CALDROS-GTO_Production_V15",
+    "description": "Ultra-aggressive EV-compounding system with dynamic leverage, multi-source signals, time-aligned news/tech fusion, and guardrailed risk.",
+    "goal": "JSON → Auto-Build → Docker → Zeabur",
+    "priority": "EV-Maximization",
+    "execution_mode": "Full-Auto",
+    "risk_style": "ultra-aggressive-with-guardrails",
+    "ai_ready": true,
+    "notes": [
+      "Supports GET/POST /api/auto-build on Zeabur (no curl required).",
+      "Unified (UM) cross margin, compounding pyramids, dynamic Kelly sizing.",
+      "Time-aligned backtest with news windows + latency/slippage simulation.",
+      "Pre-trade account balance check to recalibrate sizing and leverage.",
+      "Slack/Grafana optional; system runs without them."
+    ]
+  },
+
+  "env": {
+    "required": ["OPENAI_API_KEY"],
+    "optional": [
+      "OPENAI_API_BASE",
+      "OPENAI_MODEL",
+      "BINANCE_API_KEY",
+      "BINANCE_API_SECRET",
+      "SLACK_WEBHOOK",
+      "GRAFANA_API_KEY"
+    ]
+  },
+
+  "module_folder_structure": {
+    "root": "caldros_gto",
+    "folders": [
+      "data_ingestion",
+      "signal_engine",
+      "ev_engine",
+      "execution_system",
+      "risk_management",
+      "ai_adaptation",
+      "ops_monitor",
+      "ai_invocation_and_deployment",
+      "tests",
+      "configs",
+      "deployment",
+      "backtesting",
+      "notebooks"
+    ],
+    "entry_point": "main.py",
+    "ensure_init_files": true
+  },
+
+  "binance_account": {
+    "exchange": "BINANCE_USDT_PERP",
+    "unified_mode": true,
+    "margin_mode": "CROSS",
+    "position_mode": "ONE_WAY",
+    "symbols": ["BTCUSDT", "ETHUSDT"],
+    "recv_window_ms": 5000,
+    "latency_budget_ms": 350,
+    "min_notional_usd": 5
+  },
+
+  "time_and_sync": {
+    "exchange_clock_check_sec": 30,
+    "max_clock_skew_ms": 500,
+    "signal_decay": {
+      "half_life_sec": 120,
+      "max_age_sec": 900
+    },
+    "event_alignment": {
+      "news_event_window_sec": [ -180, 900 ],
+      "post_event_cooldown_sec": 45
+    }
+  },
+
+  "accounting": {
+    "pre_trade_balance_check": true,
+    "reserve_buffer_pct": 0.10,
+    "max_equity_utilization_pct": 0.95,
+    "daily_pnl_kill_pct": -0.25
+  },
+
+  "data_ingestion": {
+    "cadence_seconds": 30,
+    "rate_limits": { "binance_rest_rps": 8, "binance_ws_streams": 5 },
+    "sources": [
+      {
+        "name": "agg_trades",
+        "type": "websocket",
+        "endpoint": "wss://fstream.binance.com/ws/{symbol}@aggTrade",
+        "fields": { "T": "trade_time", "p": "price", "q": "quantity", "m": "is_buyer_maker", "E": "event_time" },
+        "validation": { "latency_ms_max": 200, "drop_tolerance_pct": 0.01, "reconnect_policy": "exponential_backoff" }
+      },
+      {
+        "name": "kline",
+        "type": "websocket",
+        "endpoint": "wss://fstream.binance.com/ws/{symbol}@kline_{interval}",
+        "intervals": ["1m", "5m", "15m", "1h", "4h", "1d"],
+        "fields": { "t": "open_time", "o": "open", "h": "high", "l": "low", "c": "close", "v": "volume", "n": "trade_count", "T": "close_time" },
+        "validation": { "min_candles": 1000, "gap_tolerance_sec": 10, "time_sync_check": true }
+      },
+      {
+        "name": "orderbook",
+        "type": "websocket",
+        "endpoint": "wss://fstream.binance.com/ws/{symbol}@depth20@100ms",
+        "fields": { "b": "bids", "a": "asks", "E": "event_time", "lastUpdateId": "last_update_id" },
+        "validation": { "max_bid_ask_spread_pct": 0.5, "depth_levels_min": 20, "cross_check_interval_sec": 60 }
+      },
+      {
+        "name": "funding_rate",
+        "type": "rest",
+        "endpoint": "https://fapi.binance.com/fapi/v1/fundingRate?symbol={symbol}&limit=1",
+        "fields": { "fundingRate": "rate", "fundingTime": "time" },
+        "validation": { "update_interval_hr": 8, "rate_range": [-0.05, 0.05] }
+      },
+      {
+        "name": "liquidations",
+        "type": "websocket",
+        "endpoint": "wss://fstream.binance.com/ws/{symbol}@forceOrder",
+        "fields": { "o.s": "symbol", "o.S": "side", "o.p": "price", "o.q": "quantity", "o.X": "execution_type" },
+        "validation": { "notional_min_usd": 100000, "zscore_spike_threshold": 2.5, "window_sec": 300 }
+      }
+    ],
+    "post_processing": {
+      "aggregation": { "kline_merge": true, "multi_interval_sync": true },
+      "feature_engineering": {
+        "price_velocity": "Δprice/Δt",
+        "whale_flow": "liquidation_notional_zscore",
+        "order_imbalance": "(bid_volume - ask_volume) / (bid_volume + ask_volume)",
+        "liquidity_pressure": "bid_ask_imbalance / total_depth",
+        "vol_regime": "ATR/Range with HMM regime tagging"
+      },
+      "storage": { "raw": "parquet", "features": "parquet", "compression": "snappy", "retention_days": 7 }
+    },
+    "historical": {
+      "enabled": true,
+      "rest_endpoints": {
+        "klines": "https://fapi.binance.com/fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}&startTime={start}&endTime={end}",
+        "agg_trades": "https://fapi.binance.com/fapi/v1/aggTrades?symbol={symbol}&limit={limit}&startTime={start}&endTime={end}"
+      },
+      "download_policy": { "max_days_per_job": 7, "retry": 3, "sleep_ms": 250 }
+    }
+  },
+
+  "signal_engine": {
+    "sources": [
+      "breakout",
+      "momentum",
+      "sd_liquidation",
+      "funding_flip",
+      "orderbook_imbalance",
+      "whale_flow",
+      "macro_sentiment",
+      "onchain_flow"
+    ],
+    "fusion_logic": {
+      "weights_init": {
+        "breakout": 0.20,
+        "momentum": 0.15,
+        "sd_liquidation": 0.20,
+        "funding_flip": 0.10,
+        "orderbook_imbalance": 0.10,
+        "whale_flow": 0.10,
+        "macro_sentiment": 0.10,
+        "onchain_flow": 0.05
+      },
+      "bayesian_update": true,
+      "adaptive_weighting": true,
+      "consistency_score": {
+        "min_consensus": 0.6,
+        "periods": ["1m", "5m", "15m", "1h"],
+        "context_periods": ["4h", "1d"],
+        "context_weight": 0.25
+      },
+      "decay": { "half_life_sec": 120, "max_age_sec": 900 }
+    },
+    "feature_filters": {
+      "iv_proxy": "ATR / Range",
+      "liquidation_spike": "wick_ratio + price_velocity",
+      "whale_flow_filter": "trade_notional_zscore > 2.5",
+      "correlation_filter": "cross_pair_corr < 0.7",
+      "volume_acceleration": "Δvolume/Δt > 2σ",
+      "trend_reversal_structure": "multi-kline reversal",
+      "liquidity_squeeze": "imbalance_ratio > 0.75"
+    }
+  },
+
+  "ev_engine": {
+    "formula": "EV = p * G - (1 - p) * L - fees",
+    "probability_model": {
+      "method": "rolling_bayes",
+      "window_trades": 200,
+      "beta_prior": { "alpha": 8, "beta": 5 },
+      "regime_adjust": true,
+      "dynamic_confidence": true,
+      "rl_boost": true
+    },
+    "payout_model": {
+      "G": "ATR-depth adjusted",
+      "L": "structure-stop + slippage",
+      "slippage_bp": { "base": 5, "burst": 20 },
+      "fees_bp": 1.6,
+      "volatility_penalty": true,
+      "black_swan_penalty": true
+    },
+    "thresholds": {
+      "base_activation": 0.55,
+      "consistency_adjust": true,
+      "flow_adjust": true
+    },
+    "layers": [
+      { "range": "EV ≥ 0.25", "tier": "T1_explosive", "leverage": "85x-100x", "freq": "30s-60s" },
+      { "range": "0.15 ≤ EV < 0.25", "tier": "T2_strong", "leverage": "50x-80x", "freq": "30s-90s" },
+      { "range": "0.08 ≤ EV < 0.15", "tier": "T3_moderate", "leverage": "20x-50x", "freq": "90s-180s" },
+      { "range": "0.03 ≤ EV < 0.08", "tier": "T4_neutral", "leverage": "10x-30x", "freq": "5m-20m" },
+      { "range": "-0.02 ≤ EV < 0.03", "tier": "T5_scalping", "leverage": "5x-15x", "freq": "2m-15m" },
+      { "range": "EV < -0.02", "tier": "T6_defensive", "leverage": "1x-5x", "freq": "10m-30m" }
+    ]
+  },
+
+  "execution_system": {
+    "order_flow": { "type": "FOK/IOC", "slippage_tolerance_bp": 15, "post_only": false, "reduce_only": false },
+    "trade_logic": {
+      "entry_conditions": {
+        "T1": "EV > 0.25 and structure_valid and volume_accelerating",
+        "T2": "EV > 0.15 and net_inflow_positive",
+        "T3": "EV > 0.08 and signal_consistency > 0.6",
+        "T4": "EV > 0.03 and volatility_acceptable",
+        "T5": "EV > -0.02 and risk_heat < 0.6",
+        "T6": "EV < -0.02 and volatility > 2σ → avoid"
+      },
+      "exit_conditions": {
+        "stop_loss": "structure break OR drawdown > 2σ",
+        "time_stop": "signal invalid OR time > 3 * avg_holding_period",
+        "profit_take": "EV plateau OR payout ratio collapse"
+      },
+      "dynamic_sizing": {
+        "kelly_fraction_cap": 0.25,
+        "hedge_offset": "volatility regime dependent",
+        "exposure_adjustment": "risk_heat_index"
+      },
+      "pyramiding": {
+        "enabled": true,
+        "steps": 3,
+        "multipliers": [1.0, 0.7, 0.5],
+        "add_on_rule": "EV improves AND pullback < 0.5*ATR AND slippage_ok"
+      }
+    },
+    "frequency_policy": { "mode": "auto", "min_spacing_sec": 20, "max_spacing_sec": 600 },
+    "latency_and_fills": { "target_ms": 250, "partial_fill_retry_ms": 120 }
+  },
+
+  "risk_management": {
+    "per_trade_risk_pct": 0.02,
+    "daily_drawdown_limit_pct": 0.15,
+    "max_open_positions": 5,
+    "volatility_bands_sigma": [1.0, 2.0, 3.0],
+    "circuit_breakers": {
+      "ev_collapse": "EV < 0 for 3 consecutive signals",
+      "volatility_spike": "σ > 3σ_rolling",
+      "liquidation_cluster": "force orders > 5 * avg_5m",
+      "exchange_disconnect": true
+    },
+    "portfolio_hedging": {
+      "enable": true,
+      "hedge_assets": ["BTCUSDT", "ETHUSDT"],
+      "hedge_trigger": "risk_heat > 0.8 or correlation > 0.9"
+    },
+    "cooldowns": { "loss_streak": { "n": 3, "cooldown_min": 30 }, "cb_trigger": { "cooldown_min": 180 } }
+  },
+
+  "ai_adaptation": {
+    "online_learning": {
+      "enabled": true,
+      "update_interval_hours": 6,
+      "training_data_sources": ["trade_logs", "signal_outcomes", "market_regime_labels"],
+      "algorithm": "reinforcement + Bayesian optimization",
+      "learning_rate": 0.01
+    },
+    "strategy_evolution": {
+      "self_pruning": "drop signals with <45% win rate over 100 trades",
+      "auto_weighting": "adjust weights every 100 signals based on Sharpe",
+      "mutation_experiments": 3,
+      "rollout_policy": "shadow_deploy → canary → production",
+      "validation_pipeline": { "math_validation": true, "simulation_trades": 300, "auto_accept": true }
+    },
+    "meta_learning": {
+      "global_signals": ["macro_volatility", "liquidity_index", "onchain_whale_flow", "ETF_inflows"],
+      "adaptive_thresholds": true,
+      "context_aware_risk": "regime-conditioned Kelly sizing"
+    }
+  },
+
+  "ops_monitor": {
+    "metrics": [
+      "win_rate", "sharpe_ratio", "max_drawdown", "average_slippage",
+      "order_fill_latency", "signal_latency", "volatility_regime", "risk_heat_index"
+    ],
+    "alerting": {
+      "channels": ["slack", "webhook"],
+      "critical_thresholds": {
+        "win_rate": "< 0.45",
+        "drawdown": "> 25%",
+        "latency_ms": "> 1000",
+        "signal_failure_rate": "> 0.05"
+      },
+      "cooldown_sec": 300
+    },
+    "integrations": {
+      "slack_webhook_env": "SLACK_WEBHOOK",
+      "grafana_api_key_env": "GRAFANA_API_KEY",
+      "push_enabled": false
+    }
+  },
+
+  "backtesting": {
+    "enabled": true,
+    "time_aligned": true,
+    "data_sources": {
+      "binance_rest": true,
+      "local_news_csv": true,
+      "sentiment_csv": true
+    },
+    "simulation": {
+      "slippage_bp": [2, 5, 10, 20],
+      "latency_ms": [100, 250, 500],
+      "partial_fill_prob": 0.15,
+      "disconnect_prob": 0.01
+    },
+    "validation": {
+      "oos_splits": [
+        { "train_days": 60, "test_days": 15 },
+        { "train_days": 120, "test_days": 30 }
+      ],
+      "metrics": ["CAGR", "Sharpe", "Sortino", "MaxDD", "WinRate", "ProfitFactor"],
+      "overfit_guards": {
+        "psharp_penalty": true,
+        "walk_forward_k": 4,
+        "bootstrapped_ci": true
+      }
+    }
+  },
+
+  "ai_invocation_and_deployment": {
+    "entrypoints": {
+      "root": "/",
+      "test": "/api/test",
+      "validate": "/api/validate",
+      "auto_build": "/api/auto-build",
+      "smoke": "/api/smoke",
+      "report": "/api/report"
+    },
+    "cloud_environment": {
+      "provider": "Zeabur",
+      "container": "python:3.11-slim",
+      "port": 8080,
+      "autoscaling": { "enabled": true, "min_instances": 1, "max_instances": 10, "scale_metric": "signal_rate" }
+    },
+    "post_deployment_hooks": { "backtest_validation": true, "live_sanity_check": true, "slack_notify": true },
+    "safety_checks": {
+      "config_integrity": "hash verification",
+      "model_version": ">= gpt-5",
+      "kill_switch": "if EV < -0.1 for 5 consecutive trades"
+    }
+  },
+
+  "contracts": {
+    "smoke_modules": [
+      "caldros_gto.data_ingestion.feeds",
+      "caldros_gto.signal_engine.core",
+      "caldros_gto.ev_engine.core",
+      "caldros_gto.execution_system.executor",
+      "caldros_gto.risk_management.manager",
+      "caldros_gto.ai_adaptation.online",
+      "caldros_gto.ops_monitor.metrics"
+    ]
+  },
+
+  "testing_ci": {
+    "min_lines": 20,
+    "min_functions": 1,
+    "allow_warnings": true
+  },
+
+  "llm_codegen": {
+    "enabled": true,
+    "use_get_for_build": true,
+    "model_env": "OPENAI_MODEL",
+    "base_env": "OPENAI_API_BASE",
+    "key_env": "OPENAI_API_KEY",
+    "targets": [
+      "data_ingestion/feeds.py",
+      "signal_engine/core.py",
+      "ev_engine/core.py",
+      "execution_system/executor.py",
+      "risk_management/manager.py",
+      "ai_adaptation/online.py",
+      "ops_monitor/metrics.py",
+      "tests/test_smoke.py"
+    ]
+  }
+}
